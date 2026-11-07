@@ -67,7 +67,9 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private var scanning = false
     @Volatile
     private var lastScan = 0L
-    private var lastKey: String? = null
+    private val keys = HashMap<Long, String>()
+    private lateinit var body: LinearLayout
+    private lateinit var multiHolder: LinearLayout
 
     private fun prefs() = getSharedPreferences("display", MODE_PRIVATE)
     private fun addr(): String = prefs().getString("addr", "") ?: ""
@@ -113,7 +115,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         clinicView = tv(base * 0.06f, true, Color.WHITE)
         root.addView(clinicView, LinearLayout.LayoutParams(-1, -2))
 
-        val body = LinearLayout(this)
+        body = LinearLayout(this)
         body.orientation = if (landscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
         body.layoutDirection = View.LAYOUT_DIRECTION_RTL
 
@@ -158,6 +160,13 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             body.addView(side, LinearLayout.LayoutParams(-1, 0, 1.4f))
         }
         root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = gap })
+
+        // عرض الأقسام المتعددة: بطاقة لكل قسم (يظهر بدل البطاقة الواحدة)
+        multiHolder = LinearLayout(this)
+        multiHolder.orientation = LinearLayout.VERTICAL
+        multiHolder.layoutDirection = View.LAYOUT_DIRECTION_RTL
+        multiHolder.visibility = View.GONE
+        root.addView(multiHolder, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = gap })
 
         val bottom = LinearLayout(this)
         bottom.orientation = LinearLayout.HORIZONTAL
@@ -316,7 +325,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             val found = scanNetwork()
             if (found != null) {
                 setAddr(found)
-                lastKey = null
+                keys.clear()
             }
             fails = 0
             scanning = false
@@ -336,16 +345,48 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
         statusView.text = "متصل: $a"
         clinicView.text = j.optString("clinic", "")
-        val cur = j.optJSONObject("current")
+
+        // أقسام (جهاز رئيسي 1.5 فأحدث) أو الحقول القديمة لقسم واحد
+        val list = mutableListOf<JSONObject>()
+        val arr = j.optJSONArray("depts")
+        if (arr != null && arr.length() > 0) {
+            for (i in 0 until arr.length()) list.add(arr.getJSONObject(i))
+        } else {
+            list.add(j)
+        }
+        val multi = list.size > 1
+        body.visibility = if (multi) View.GONE else View.VISIBLE
+        multiHolder.visibility = if (multi) View.VISIBLE else View.GONE
+        for (d in list) checkAnnounce(d, multi)
+        if (multi) renderMulti(list) else renderSingle(list[0])
+    }
+
+    private fun typeColor(cur: JSONObject): Int {
+        val c = cur.optInt("color", 0)
+        return if (c != 0) c else if (cur.optBoolean("urgent")) URGENT else GREEN
+    }
+
+    private fun recentText(rec: org.json.JSONArray?): String {
+        if (rec == null || rec.length() == 0) return ""
+        val sb = StringBuilder()
+        for (i in 0 until rec.length()) {
+            if (i > 0) sb.append(" ، ")
+            sb.append(rec.getJSONObject(i).optInt("number"))
+        }
+        return sb.toString()
+    }
+
+    private fun renderSingle(d: JSONObject) {
+        val cur = d.optJSONObject("current")
         if (cur == null) {
             numView.text = "-"
             typeView.text = ""
         } else {
             numView.text = cur.optInt("number").toString()
             typeView.text = cur.optString("type")
-            typeView.setTextColor(if (cur.optBoolean("urgent")) URGENT else GREEN)
+            typeView.setTextColor(typeColor(cur))
         }
-        val rec = j.optJSONArray("recent")
+        val rec = d.optJSONArray("recent")
         val sb = StringBuilder()
         if (rec != null) {
             for (i in 0 until rec.length()) {
@@ -354,22 +395,85 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             }
         }
         recentView.text = if (sb.isEmpty()) "-" else sb.toString().trimEnd()
-        waitView.text = "عدد المنتظرين: " + j.optInt("waiting")
+        waitView.text = "عدد المنتظرين: " + d.optInt("waiting")
+    }
 
-        val key = if (cur == null) "" else cur.optLong("id").toString() + ":" + cur.optLong("calledAt") + ":" + j.optLong("recall")
-        if (key != lastKey) {
-            if (lastKey != null && cur != null) announce(cur.optInt("number"), cur.optString("type"))
-            lastKey = key
+    private fun renderMulti(list: List<JSONObject>) {
+        multiHolder.removeAllViews()
+        val m = resources.displayMetrics
+        val landscape = m.widthPixels > m.heightPixels
+        val n = list.size
+        val cols = if (landscape) {
+            if (n <= 3) n else Math.ceil(Math.sqrt(n.toDouble())).toInt()
+        } else {
+            if (n <= 2) 1 else 2
+        }
+        val rows = (n + cols - 1) / cols
+        val unit = minOf(m.widthPixels * 0.94f / cols, m.heightPixels * 0.72f / rows)
+        val gap = (unit * 0.04f).toInt()
+        for (r in 0 until rows) {
+            val rowL = LinearLayout(this)
+            rowL.orientation = LinearLayout.HORIZONTAL
+            rowL.layoutDirection = View.LAYOUT_DIRECTION_RTL
+            for (c in 0 until cols) {
+                val idx = r * cols + c
+                val lp = LinearLayout.LayoutParams(0, -1, 1f).apply { setMargins(gap, gap, gap, gap) }
+                if (idx < n) rowL.addView(deptCard(list[idx], unit), lp) else rowL.addView(View(this), lp)
+            }
+            multiHolder.addView(rowL, LinearLayout.LayoutParams(-1, 0, 1f))
         }
     }
 
-    private fun announce(number: Int, type: String) {
+    private fun deptCard(d: JSONObject, unit: Float): LinearLayout {
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.gravity = Gravity.CENTER_HORIZONTAL
+        card.background = rounded(Color.WHITE, (unit * 0.06f).toInt())
+        val name = tv(unit * 0.085f, true, Color.WHITE)
+        name.text = d.optString("name")
+        val dc = d.optInt("color", 0)
+        name.background = rounded(if (dc != 0) dc else BLUE, (unit * 0.04f).toInt())
+        name.setPadding(0, (unit * 0.02f).toInt(), 0, (unit * 0.02f).toInt())
+        card.addView(name, LinearLayout.LayoutParams(-1, -2))
+        val cur = d.optJSONObject("current")
+        val num = tv(unit * 0.42f, true, BLUE)
+        num.text = if (cur == null) "-" else cur.optInt("number").toString()
+        card.addView(num)
+        val ty = tv(unit * 0.075f, true, if (cur == null) GREEN else typeColor(cur))
+        ty.text = cur?.optString("type") ?: ""
+        card.addView(ty)
+        val w = tv(unit * 0.06f, false, 0xFF5B6B7A.toInt())
+        w.text = "المنتظرون: " + d.optInt("waiting")
+        card.addView(w)
+        val rt = recentText(d.optJSONArray("recent"))
+        if (rt.isNotEmpty()) {
+            val r = tv(unit * 0.055f, false, 0xFF5B6B7A.toInt())
+            r.text = "آخر الأرقام: " + rt
+            card.addView(r)
+        }
+        return card
+    }
+
+    /** يتحقق من تغيّر الرقم الحالي لقسم فيناديه (وأول قراءة لا تنادي) */
+    private fun checkAnnounce(d: JSONObject, multi: Boolean) {
+        val cur = d.optJSONObject("current")
+        val id = d.optLong("id", 0L)
+        val key = if (cur == null) "" else cur.optLong("id").toString() + ":" + cur.optLong("calledAt") + ":" + d.optLong("recall")
+        val old = keys[id]
+        keys[id] = key
+        if (old != null && old != key && cur != null) {
+            announce(cur.optInt("number"), cur.optString("type"), if (multi) d.optString("name") else "")
+        }
+    }
+
+    private fun announce(number: Int, type: String, dept: String) {
         try {
             tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 400)
         } catch (e: Exception) {
         }
+        val extra = if (dept.isNotEmpty()) "، " + dept else ""
         ui.postDelayed({
-            if (ttsReady) tts?.speak("على رقم ${number}، ${type}", TextToSpeech.QUEUE_FLUSH, null, "call")
+            if (ttsReady) tts?.speak("على رقم ${number}، ${type}" + extra, TextToSpeech.QUEUE_FLUSH, null, "call")
         }, 500)
     }
 
@@ -402,7 +506,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             if (a.isNotEmpty() && !a.contains(":")) a += ":" + PORT
             setAddr(a)
             fails = 0
-            lastKey = null
+            keys.clear()
             Toast.makeText(this, "تم الحفظ", Toast.LENGTH_SHORT).show()
             dlg.dismiss()
         })
@@ -412,7 +516,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             lastScan = 0L
             dlg.dismiss()
         })
-        box.addView(btn("اختبار الصوت") { announce(7, "اختبار الصوت") })
+        box.addView(btn("اختبار الصوت") { announce(7, "اختبار الصوت", "") })
         dlg.show()
         immersive()
     }
